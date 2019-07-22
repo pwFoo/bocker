@@ -1,54 +1,38 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -o errexit -o nounset -o pipefail; shopt -s nullglob
 btrfs_path='/var/bocker' && cgroups='cpu,cpuacct,memory';
 [[ $# -gt 0 ]] && while [ "${1:0:2}" == '--' ]; do OPTION=${1:2}; [[ $OPTION =~ = ]] && declare "BOCKER_${OPTION/=*/}=${OPTION/*=/}" || declare "BOCKER_${OPTION}=x"; shift; done
 
-# return 0 if the image is exist
-# return 1 if the image is NOT exist
 function bocker_check() {
     btrfs subvolume list "$btrfs_path" | grep -qw "$1" && echo 0 || echo 1
 }
 
-
 function bocker_init() { #HELP Create an image from a directory:\nBOCKER init <directory>
-    # gen a random uuid
     uuid="img_$(shuf -i 42002-42254 -n 1)"
-    # the input directory is exist
     if [[ -d "$1" ]]; then
-        # run container if same uuid exist
-        [[ "$(bocker_check "$uuid")" == 0 ]] && bocker_run "$@"
-        # create a new subvolume for new image
+        [[ "$(bocker_check "$uuid")" == 0 ]] && echo "UUID conflict, retrying..." && bocker_init "$@" && return
         btrfs subvolume create "$btrfs_path/$uuid" > /dev/null
-        # copy all file under <directory> to subvolume
         cp -rf --reflink=auto "$1"/* "$btrfs_path/$uuid" > /dev/null
-        # confirm the img.source file is not exist, and create it from <directory>
         [[ ! -f "$btrfs_path/$uuid"/img.source ]] && echo "$1" > "$btrfs_path/$uuid"/img.source
         echo "Created: $uuid"
-        # if the input directory is NOT exist
     else
         echo "No directory named '$1' exists"
     fi
 }
 
 function bocker_pull() { #HELP Pull an image from Docker Hub:\nBOCKER pull <name> <tag>
-
-    # get token to request image from docker registry v2
     token=$(curl "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/$1:pull"  | jq '.token'| sed 's/\"//g')
     registry_base='https://registry-1.docker.io/v2'
     tmp_uuid="$(uuidgen)" && mkdir /tmp/"$tmp_uuid"
 
-    # fetch every layer of the image, save its ID to list
     manifest=$(curl -sL -H "Accept:application/vnd.docker.distribution.manifest.v2+json" -H "Authorization: Bearer $token" "$registry_base/library/$1/manifests/$2" | jq -r '.layers' | jq -r '.[].digest' )
     #[[ "${#manifest[@]}" -lt 1 ]] && echo "No image named '$1:$2' exists" && exit 1
 
-    # download each layer and uncompress it to tmp directory
     for id in ${manifest[@]}; do
         curl -#L -H "Authorization: Bearer $token" "$registry_base/library/$1/blobs/$id" -o /tmp/"$tmp_uuid"/layer.tar
         tar xf /tmp/"$tmp_uuid"/layer.tar -C /tmp/"$tmp_uuid"
     done
-    # write image:version to img.source file
     echo "$1:$2" > /tmp/"$tmp_uuid"/img.source
-    # build the image with files from all layer
     bocker_init /tmp/"$tmp_uuid" && rm -rf /tmp/"$tmp_uuid"
 }
 
@@ -80,7 +64,6 @@ function bocker_run() { #HELP Create a container:\nBOCKER run <image_id> <comman
     uuid="ps_$(shuf -i 42002-42254 -n 1)"
     [[ "$(bocker_check "$1")" == 1 ]] && echo "No image named '$1' exists" && exit 1
     [[ "$(bocker_check "$uuid")" == 0 ]] && echo "UUID conflict, retrying..." && bocker_run "$@" && return
-    #cmd="${@:2}" && ip="$(echo "${uuid: -3}" | sed 's/0//g')" && mac="${uuid: -3:1}:${uuid: -2}"
     cmd="${@:2}" && ip="$(echo "${uuid: -3}" | sed 's/0//g')" && mac="${uuid: -2}"
     ip link add dev veth0_"$uuid" type veth peer name veth1_"$uuid"
     ip link set dev veth0_"$uuid" up
@@ -88,7 +71,7 @@ function bocker_run() { #HELP Create a container:\nBOCKER run <image_id> <comman
     ip netns add netns_"$uuid"
     ip link set veth1_"$uuid" netns netns_"$uuid"
     ip netns exec netns_"$uuid" ip link set dev lo up
-    #ip netns exec netns_"$uuid" ip link set veth1_"$uuid" address 02:42:ac:11:00:"$mac"
+    ip netns exec netns_"$uuid" ip link set veth1_"$uuid" address 02:42:ac:11:00:"$mac"
     ip netns exec netns_"$uuid" ip addr add 10.0.0."$ip"/24 dev veth1_"$uuid"
     ip netns exec netns_"$uuid" ip link set dev veth1_"$uuid" up
     ip netns exec netns_"$uuid" ip route add default via 10.0.0.1
@@ -110,7 +93,8 @@ function bocker_run() { #HELP Create a container:\nBOCKER run <image_id> <comman
 
 function bocker_exec() { #HELP Execute a command in a running container:\nBOCKER exec <container_id> <command>
     [[ "$(bocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
-    cid="$(ps o ppid,pid | grep "^$(ps o pid,cmd | grep -E "^\ *[0-9]+ unshare.*$1" | awk '{print $1}')" | awk '{print $2}')"
+    unshare_pid=$(ps o pid,cmd -u root | grep "unshare.*$1" | awk '{print $1}')
+    cid="$(ps o ppid,pid -u root| grep "$unshare_pid" | tail -n 1 | awk '{print $2}')"
     [[ ! "$cid" =~ ^\ *[0-9]+$ ]] && echo "Container '$1' exists but is not running" && exit 1
     nsenter -t "$cid" -m -u -i -n -p chroot "$btrfs_path/$1" "${@:2}"
 }

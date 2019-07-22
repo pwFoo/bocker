@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-set -o errexit -o nounset -o pipefail
+#set -o errexit -o nounset -o pipefail
 
 img="$(./bocker init ~/base-image | awk '{print $2}')"
 ./bocker images | grep -qw "$img"
 [[ "$?" == 0 ]]
 
 # ▼ ▼ ▼ Race condition waiting to happen ▼ ▼ ▼
-./bocker run "$img" "sleep 5 && ps aux" &
+./bocker run "$img" "sleep 10 && ps aux" &
 sleep 2
-ps="$(./bocker ps | grep 'sleep 5' | awk '{print $1}')"
+ps="$(./bocker ps | grep 'sleep' | awk '{print $1}')"
 exec="$(./bocker exec "$ps" ps aux | wc -l)"
 [[ "$exec" == "4" ]]
-sleep 3
+sleep 8
 # ▲ ▲ ▲ Race condition waiting to happen ▲ ▲ ▲
 
 ./bocker run "$img" ps aux
